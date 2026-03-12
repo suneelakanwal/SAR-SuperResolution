@@ -1,2 +1,18 @@
-data/S1A_IW_GRDH_1SDV_20230115T052548_20230115T052613_046790_059C18_9C58.SAFE.zip is 1695.87 MB
+# =========================
+# SAR Dataset & Large Files
+# =========================
+
+# Ignore the raw downloaded zip archives
+data/*.zip
+
+# Ignore the extracted Sentinel-1 SAFE folders
+data/*.SAFE/
+
+# Ignore all raw TIFF files
+data/**/*.tiff
+data/**/*.tif
+
+# Ignore the folder containing all the generated HR/LR training images
+data/SAR_Dataset/
+
 
