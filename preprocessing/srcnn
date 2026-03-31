@@ -1,1 +1,524 @@
+#  Imports & Setup 
+%matplotlib inline
+from IPython.display import display, Image as IPImage
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+import torchvision.models as models
+import numpy as np
+import h5py
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+import os, gc
+ 
+rcParams['font.family'] = 'serif'
+rcParams['font.serif']  = ['DejaVu Serif', 'Times New Roman', 'Times']
+rcParams['font.size']   = 10
+ 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.cuda.is_available():
+    print(f" GPU : {torch.cuda.get_device_name(0)}")
+else:
+    print("  No GPU found — enable GPU in Kaggle Settings → Accelerator")
+ 
+SAVE_DIR = '/kaggle/working/esrgan_outputs'
+os.makedirs(SAVE_DIR, exist_ok=True)
+ 
+train_h5 = '/kaggle/working/sar_train_x2.h5'
+eval_h5  = '/kaggle/working/sar_eval_x2.h5'
+print(f"Output dir : {SAVE_DIR}")
+print(f"Train HDF5 : {train_h5}")
+print(f" Eval  HDF5 : {eval_h5}")
+
+
+ 
+# ── Residual Dense Block (RDB) ───────────────────────────────
+class ResidualDenseBlock(nn.Module):
+    """
+    Residual Dense Block — core unit of RRDB.
+    5 conv layers with dense connections + residual scaling.
+    """
+    def __init__(self, nf=64, gc=32, bias=True):
+        super().__init__()
+        self.conv1 = nn.Conv2d(nf,      gc, 3, 1, 1, bias=bias)
+        self.conv2 = nn.Conv2d(nf+gc,   gc, 3, 1, 1, bias=bias)
+        self.conv3 = nn.Conv2d(nf+2*gc, gc, 3, 1, 1, bias=bias)
+        self.conv4 = nn.Conv2d(nf+3*gc, gc, 3, 1, 1, bias=bias)
+        self.conv5 = nn.Conv2d(nf+4*gc, nf, 3, 1, 1, bias=bias)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+ 
+    def forward(self, x):
+        x1 = self.lrelu(self.conv1(x))
+        x2 = self.lrelu(self.conv2(torch.cat([x, x1], dim=1)))
+        x3 = self.lrelu(self.conv3(torch.cat([x, x1, x2], dim=1)))
+        x4 = self.lrelu(self.conv4(torch.cat([x, x1, x2, x3], dim=1)))
+        x5 = self.conv5(torch.cat([x, x1, x2, x3, x4], dim=1))
+        return x5 * 0.2 + x   # residual scaling β=0.2
+ 
+ 
+# ── Residual-in-Residual Dense Block (RRDB) ──────────────────
+class RRDB(nn.Module):
+    """RRDB: 3 stacked RDBs with outer residual connection."""
+    def __init__(self, nf=64, gc=32):
+        super().__init__()
+        self.rdb1 = ResidualDenseBlock(nf, gc)
+        self.rdb2 = ResidualDenseBlock(nf, gc)
+        self.rdb3 = ResidualDenseBlock(nf, gc)
+ 
+    def forward(self, x):
+        out = self.rdb1(x)
+        out = self.rdb2(out)
+        out = self.rdb3(out)
+        return out * 0.2 + x
+ 
+ 
+# ── Generator (RRDBNet) ───────────────────────────────────────
+class RRDBNet(nn.Module):
+    """
+    ESRGAN Generator — RRDBNet.
+    in_nc=1  : single-channel grayscale SAR input
+    out_nc=1 : single-channel output
+    nf=64    : feature channels (reduced from 128 for Kaggle RAM)
+    nb=8     : number of RRDB blocks (reduced from 23)
+    scale=2  : upscale factor
+    """
+    def __init__(self, in_nc=1, out_nc=1, nf=64, nb=8, scale=2):
+        super().__init__()
+        self.scale = scale
+ 
+        # First conv
+        self.conv_first = nn.Conv2d(in_nc, nf, 3, 1, 1, bias=True)
+ 
+        # RRDB trunk
+        trunk = [RRDB(nf) for _ in range(nb)]
+        self.trunk   = nn.Sequential(*trunk)
+        self.conv_trunk = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+ 
+        # Upsampling (pixel shuffle)
+        n_upscale = int(np.log2(scale))
+        upsample_layers = []
+        for _ in range(n_upscale):
+            upsample_layers += [
+                nn.Conv2d(nf, nf * 4, 3, 1, 1, bias=True),
+                nn.PixelShuffle(2),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+        self.upsample = nn.Sequential(*upsample_layers)
+ 
+        self.conv_hr   = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True)
+        self.lrelu     = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+ 
+    def forward(self, x):
+        fea    = self.conv_first(x)
+        trunk  = self.conv_trunk(self.trunk(fea))
+        fea    = fea + trunk                        # global residual
+        fea    = self.upsample(fea)
+        out    = self.conv_last(self.lrelu(self.conv_hr(fea)))
+        return out
+ 
+ 
+# ── Discriminator ─────────────────────────────────────────────
+class Discriminator(nn.Module):
+    """
+    VGG-style discriminator for 66×66 single-channel patches.
+    """
+    def __init__(self, in_nc=1):
+        super().__init__()
+ 
+        def block(in_f, out_f, stride):
+            return [
+                nn.Conv2d(in_f, out_f, 3, stride, 1, bias=False),
+                nn.BatchNorm2d(out_f),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+ 
+        layers = [nn.Conv2d(in_nc, 64, 3, 1, 1),
+                  nn.LeakyReLU(0.2, inplace=True)]
+        layers += block(64,  64,  2)
+        layers += block(64,  128, 1)
+        layers += block(128, 128, 2)
+        layers += block(128, 256, 1)
+        layers += block(256, 256, 2)
+        layers += block(256, 512, 1)
+        layers += block(512, 512, 2)
+ 
+        self.features = nn.Sequential(*layers)
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(512, 1024),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(1024, 1),
+        )
+ 
+    def forward(self, x):
+        return self.classifier(self.features(x))
+ 
+ 
+# ── VGG Perceptual Loss (grayscale — repeat channel trick) ────
+class VGGPerceptualLoss(nn.Module):
+    """
+    Uses VGG19 conv3_4 features for perceptual loss.
+    SAR is grayscale so we expand to 3 channels before VGG.
+    """
+    def __init__(self):
+        super().__init__()
+        vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT)
+        # Use features up to conv3_4 (layer index 18)
+        self.feature_extractor = nn.Sequential(
+            *list(vgg.features.children())[:18]
+        ).eval()
+        for p in self.feature_extractor.parameters():
+            p.requires_grad = False
+ 
+    def forward(self, sr, hr):
+        # Expand grayscale → 3-channel (VGG expects RGB)
+        sr3 = sr.repeat(1, 3, 1, 1)
+        hr3 = hr.repeat(1, 3, 1, 1)
+        return nn.functional.mse_loss(
+            self.feature_extractor(sr3),
+            self.feature_extractor(hr3)
+        )
+ 
+ 
+#  Instantiate all models 
+SCALE = 2
+ 
+netG = RRDBNet(in_nc=1, out_nc=1, nf=64, nb=8, scale=SCALE).to(device)
+netD = Discriminator(in_nc=1).to(device)
+vgg_loss = VGGPerceptualLoss().to(device)
+ 
+g_params = sum(p.numel() for p in netG.parameters() if p.requires_grad)
+d_params = sum(p.numel() for p in netD.parameters() if p.requires_grad)
+print(f" Generator     params : {g_params:,}")
+print(f" Discriminator params : {d_params:,}")
+print(f" Models ready on      : {device}")
+ 
+
+# ============================================================
+#  Build HDF5 from scratch 
+# ============================================================
+from PIL import Image, ImageFile
+import numpy as np
+import os, h5py, gc, shutil
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS = None
+
+# ── Paths ─────────────────────────────────────────────────────
+img_path  = '/kaggle/input/datasets/suneelakanwal/dataset12/image.tiff'
+tiles_dir = '/kaggle/working/sar_tiles'
+train_dir = '/kaggle/working/sar_train'
+eval_dir  = '/kaggle/working/sar_eval'
+out_train = '/kaggle/working/sar_train_x2.h5'
+out_eval  = '/kaggle/working/sar_eval_x2.h5'
+
+for d in [tiles_dir, train_dir, eval_dir]:
+    os.makedirs(d, exist_ok=True)
+
+# ── Settings ──────────────────────────────────────────────────
+TILE_SIZE  = 256
+STRIDE_T   = 128    # tile stride
+MIN_STD    = 5.0
+SCALE      = 2
+PATCH_SIZE = 33
+STRIDE_P   = 21
+MAX_TILES  = 2000
+LABEL_SIZE = PATCH_SIZE * SCALE  # 66
+
+# ════════════════════════════════════════════════════════════
+# STEP 1 — Load & normalize img1.png
+# ════════════════════════════════════════════════════════════
+print(" Loading image.tiff ...")
+img   = Image.open(img_path).convert('L')
+W, H  = img.size
+band  = np.array(img).astype(np.float32)
+del img
+
+p2, p98    = np.percentile(band, 2), np.percentile(band, 98)
+band_clip  = np.clip(band, p2, p98)
+band_norm  = ((band_clip - p2) / (p98 - p2 + 1e-8) * 255).astype(np.uint8)
+del band, band_clip
+print(f" Image loaded: {W}x{H}px  |  normalized to [0,255]")
+
+# ════════════════════════════════════════════════════════════
+# STEP 2 — Extract 256×256 tiles
+# ════════════════════════════════════════════════════════════
+print("\n🔲 Extracting tiles ...")
+saved, skipped = 0, 0
+
+for y in range(0, H - TILE_SIZE + 1, STRIDE_T):
+    for x in range(0, W - TILE_SIZE + 1, STRIDE_T):
+        tile = band_norm[y:y+TILE_SIZE, x:x+TILE_SIZE]
+        if tile.std() < MIN_STD:
+            skipped += 1
+            continue
+        Image.fromarray(tile).save(
+            os.path.join(tiles_dir, f"tile_{y:05d}_{x:05d}.png"))
+        saved += 1
+
+del band_norm
+print(f" Tiles saved: {saved}  |  skipped (flat): {skipped}")
+
+# ── 80/20 split ───────────────────────────────────────────────
+all_tiles = [f for f in os.listdir(tiles_dir) if f.endswith('.png')]
+train_tiles, eval_tiles = train_test_split(
+    all_tiles, test_size=0.2, random_state=42)
+
+for f in train_tiles:
+    shutil.copy(os.path.join(tiles_dir, f), os.path.join(train_dir, f))
+for f in eval_tiles:
+    shutil.copy(os.path.join(tiles_dir, f), os.path.join(eval_dir, f))
+
+print(f" Train tiles: {len(train_tiles)}  |  Eval tiles: {len(eval_tiles)}")
+
+# ════════════════════════════════════════════════════════════
+# STEP 3 — Stream patches → HDF5
+# ════════════════════════════════════════════════════════════
+def build_hdf5(image_dir, output_path, max_tiles):
+    tile_files = sorted([f for f in os.listdir(image_dir)
+                         if f.endswith('.png')])
+    if len(tile_files) > max_tiles:
+        np.random.seed(42)
+        tile_files = list(np.random.choice(
+            tile_files, max_tiles, replace=False))
+
+    # Count patches first
+    total = 0
+    for fname in tile_files:
+        img  = Image.open(os.path.join(image_dir, fname)).convert('L')
+        W_t, H_t = img.size
+        W_a = W_t // SCALE * SCALE
+        H_a = H_t // SCALE * SCALE
+        total += max(0, (H_a - LABEL_SIZE) // STRIDE_P + 1) * \
+                 max(0, (W_a - LABEL_SIZE) // STRIDE_P + 1)
+    print(f"   Total patches: {total:,}")
+
+    with h5py.File(output_path, 'w') as hf:
+        ds_lr = hf.create_dataset('data',
+            shape=(total, 1, LABEL_SIZE, LABEL_SIZE),
+            dtype=np.float32, compression='gzip',
+            compression_opts=1,
+            chunks=(256, 1, LABEL_SIZE, LABEL_SIZE))
+        ds_hr = hf.create_dataset('label',
+            shape=(total, 1, LABEL_SIZE, LABEL_SIZE),
+            dtype=np.float32, compression='gzip',
+            compression_opts=1,
+            chunks=(256, 1, LABEL_SIZE, LABEL_SIZE))
+
+        write_idx = 0
+        CHUNK = 512
+        lr_buf, hr_buf = [], []
+
+        for fname in tqdm(tile_files, desc=os.path.basename(output_path)):
+            img  = Image.open(
+                os.path.join(image_dir, fname)).convert('L')
+            W_t, H_t = img.size
+            W_a = W_t // SCALE * SCALE
+            H_a = H_t // SCALE * SCALE
+            img = img.resize((W_a, H_a), Image.BICUBIC)
+
+            hr_arr = np.array(img).astype(np.float32) / 255.0
+            lr_img = img.resize(
+                (W_a//SCALE, H_a//SCALE), Image.BICUBIC)
+            lr_img = lr_img.resize((W_a, H_a), Image.BICUBIC)
+            lr_arr = np.array(lr_img).astype(np.float32) / 255.0
+
+            for y in range(0, H_a - LABEL_SIZE + 1, STRIDE_P):
+                for x in range(0, W_a - LABEL_SIZE + 1, STRIDE_P):
+                    hr_buf.append(
+                        hr_arr[y:y+LABEL_SIZE,
+                               x:x+LABEL_SIZE][np.newaxis])
+                    lr_buf.append(
+                        lr_arr[y:y+LABEL_SIZE,
+                               x:x+LABEL_SIZE][np.newaxis])
+                    if len(hr_buf) >= CHUNK:
+                        end = write_idx + len(hr_buf)
+                        ds_lr[write_idx:end] = np.array(lr_buf)
+                        ds_hr[write_idx:end] = np.array(hr_buf)
+                        write_idx += len(hr_buf)
+                        lr_buf, hr_buf = [], []
+
+            del img, hr_arr, lr_arr, lr_img
+            gc.collect()
+
+        if hr_buf:
+            end = write_idx + len(hr_buf)
+            ds_lr[write_idx:end] = np.array(lr_buf)
+            ds_hr[write_idx:end] = np.array(hr_buf)
+            write_idx += len(hr_buf)
+
+    size_mb = os.path.getsize(output_path) / 1e6
+    print(f" Saved: {output_path}  ({size_mb:.1f} MB)  "
+          f"| {write_idx:,} patches")
+    return write_idx
+
+print("\n Building TRAIN HDF5 ...")
+n_train = build_hdf5(train_dir, out_train, MAX_TILES)
+gc.collect()
+
+print("\n Building EVAL HDF5 ...")
+n_eval = build_hdf5(eval_dir, out_eval, 400)
+gc.collect()
+
+# ── Verify ────────────────────────────────────────────────────
+print("\n" + "="*50)
+print("   HDF5 FILES READY")
+print("="*50)
+for path in [out_train, out_eval]:
+    with h5py.File(path, 'r') as hf:
+        print(f"  {os.path.basename(path)}")
+        print(f"    data  : {hf['data'].shape}")
+        print(f"    label : {hf['label'].shape}")
+print("="*50)
+print("    Now run Cell 3 (DataLoader)")
+
+
+
+
+# ============================================================
+# Dataset & DataLoaders + Visualization
+# ============================================================
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+from IPython.display import display, Image as IPImage
+
+rcParams['font.family'] = 'serif'
+rcParams['font.serif']  = ['DejaVu Serif', 'Times New Roman', 'Times']
+
+class SARDataset(Dataset):
+    def __init__(self, h5_path):
+        with h5py.File(h5_path, 'r') as hf:
+            self.length = len(hf['data'])
+        self.h5_path = h5_path
+        self.hf      = None
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        if self.hf is None:
+            self.hf = h5py.File(self.h5_path, 'r')
+        lr = torch.from_numpy(self.hf['data'][idx])
+        hr = torch.from_numpy(self.hf['label'][idx])
+        return lr, hr
+
+
+BATCH_SIZE = 32
+MAX_TRAIN  = 30000
+MAX_EVAL   = 3000
+
+full_train = SARDataset(train_h5)
+full_eval  = SARDataset(eval_h5)
+
+train_idx = np.random.choice(len(full_train),
+                              min(MAX_TRAIN, len(full_train)),
+                              replace=False)
+eval_idx  = np.random.choice(len(full_eval),
+                              min(MAX_EVAL, len(full_eval)),
+                              replace=False)
+
+train_loader = DataLoader(Subset(full_train, train_idx),
+                          batch_size=BATCH_SIZE, shuffle=True,
+                          num_workers=2, pin_memory=True)
+eval_loader  = DataLoader(Subset(full_eval, eval_idx),
+                          batch_size=16, shuffle=False,
+                          num_workers=2, pin_memory=True)
+
+print(f" Train : {len(train_idx):,} samples | {len(train_loader)} batches")
+print(f" Eval  : {len(eval_idx):,}  samples | {len(eval_loader)} batches")
+
+# ── 4 fixed patches for visual preview ───────────────────────
+preview_patches = []
+with h5py.File(eval_h5, 'r') as hf:
+    for i in range(4):
+        preview_patches.append((
+            torch.from_numpy(hf['data'][i]).unsqueeze(0),
+            torch.from_numpy(hf['label'][i]).unsqueeze(0)
+        ))
+print(" Preview patches ready")
+
+# ════════════════════════════════════════════════════════════
+# FIGURE — Dataset Summary: 4 LR/HR patch pairs
+# ════════════════════════════════════════════════════════════
+fig, axes = plt.subplots(3, 4, figsize=(18, 13))
+fig.suptitle(
+    f"ESRGAN Dataset — Patch Pair Preview\n"
+    f"Train: {len(train_idx):,} patches  |  "
+    f"Eval: {len(eval_idx):,} patches  |  "
+    f"Scale: ×{SCALE}  |  Patch: {LABEL_SIZE}×{LABEL_SIZE}px",
+    fontsize=13, fontweight='bold'
+)
+
+col_labels = ['Patch 1', 'Patch 2', 'Patch 3', 'Patch 4']
+row_labels = [' LR Input\n(Bicubic Degraded)',
+              ' HR Target\n(Ground Truth)',
+              ' Difference Map\n(Detail Lost)']
+row_colors = ['crimson', 'green', 'darkorange']
+
+for col, (lr_t, hr_t) in enumerate(preview_patches):
+    lr_np  = lr_t[0, 0].numpy()
+    hr_np  = hr_t[0, 0].numpy()
+    diff   = np.abs(hr_np.astype(np.float32) -
+                    lr_np.astype(np.float32))
+
+    # Row 0 — LR
+    axes[0][col].imshow(lr_np, cmap='gray', vmin=0, vmax=1,
+                         interpolation='nearest', aspect='auto')
+    axes[0][col].set_title(col_labels[col], fontsize=11,
+                            fontweight='bold')
+    axes[0][col].axis('off')
+
+    # Row 1 — HR
+    axes[1][col].imshow(hr_np, cmap='gray', vmin=0, vmax=1,
+                         interpolation='nearest', aspect='auto')
+    axes[1][col].axis('off')
+
+    # Row 2 — Difference
+    im = axes[2][col].imshow(diff, cmap='hot',
+                              vmin=0, vmax=diff.max() + 1e-6,
+                              interpolation='nearest', aspect='auto')
+    axes[2][col].axis('off')
+    plt.colorbar(im, ax=axes[2][col],
+                 fraction=0.046, pad=0.04, label='|HR - LR|')
+
+# Row labels on left
+for row, (label, color) in enumerate(zip(row_labels, row_colors)):
+    axes[row][0].set_ylabel(label, fontsize=10, fontweight='bold',
+                             color=color, rotation=0,
+                             labelpad=120, va='center')
+
+plt.tight_layout()
+
+save_base = '/kaggle/working/esrgan_outputs/cell3_dataset_preview'
+plt.savefig(f'{save_base}.png', dpi=200,
+            bbox_inches='tight', facecolor='white')
+plt.savefig(f'{save_base}.pdf', dpi=200,
+            bbox_inches='tight', facecolor='white')
+plt.show()
+display(IPImage(f'{save_base}.png'))
+print(f" Saved: {save_base}.png / .pdf")
+
+# ── Dataset stats ─────────────────────────────────────────────
+print("\n" + "="*55)
+print("   DATASET SUMMARY")
+print("="*55)
+print(f"  HDF5 Train : {train_h5}")
+print(f"  HDF5 Eval  : {eval_h5}")
+print(f"  Train patches used : {len(train_idx):,}")
+print(f"  Eval  patches used : {len(eval_idx):,}")
+print(f"  Batch size         : {BATCH_SIZE}")
+print(f"  Train batches      : {len(train_loader)}")
+print(f"  Eval  batches      : {len(eval_loader)}")
+print(f"  Patch size         : {LABEL_SIZE}×{LABEL_SIZE}px")
+print(f"  Scale factor       : ×{SCALE}")
+print("="*55)
+print("  Ready for Cell 4 — ESRGAN Training!")
+
 
