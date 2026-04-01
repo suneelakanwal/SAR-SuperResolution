@@ -15,4 +15,7 @@ data/**/*.tif
 # Ignore the folder containing all the generated HR/LR training images
 data/SAR_Dataset/
 
+# Ignore the raw downloaded tar archives
+srgan_outputs/*.tar
+
 
